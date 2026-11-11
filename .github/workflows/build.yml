@@ -1,0 +1,46 @@
+name: Build NetTcpHub
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build NetTcpHub (.NET Framework 4.8 x64)
+      run: |
+        msbuild NetTcpHub.csproj /p:Configuration=Release /p:Platform=x64 /restore /verbosity:minimal
+
+    - name: Prepare Artifacts
+      shell: pwsh
+      run: |
+        $outputDir = "bin/x64/Release/net48"
+        if (-not (Test-Path $outputDir)) {
+          $outputDir = "bin/Release/net48"
+        }
+        New-Item -ItemType Directory -Force -Path staging
+        Copy-Item -Path "$outputDir/*" -Destination staging/ -Recurse
+        Compress-Archive -Path "staging/*" -DestinationPath "NetTcpHub-net48-x64.zip"
+
+    - name: Upload Zip Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: NetTcpHub-Release-x64
+        path: NetTcpHub-net48-x64.zip
+        if-no-files-found: error

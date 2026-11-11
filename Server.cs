@@ -1,15 +1,16 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
+using System.Net;
+using System.Net.Security;
 using System.ServiceModel;
 using System.ServiceModel.Channels;
 using System.ServiceModel.Description;
 using System.ServiceModel.Dispatcher;
-using NetTcpHub.Contracts;
-using System.Linq;
-using System.IO;
+using System.Threading.Tasks;
 using NetTcpHub.Client;
+using NetTcpHub.Contracts;
 
 namespace NetTcpHub.Server
 {
@@ -21,12 +22,28 @@ namespace NetTcpHub.Server
         public int MaxConnections { get; set; } = 100;
         public bool AllowNtlm { get; set; } = true;
         public bool EnableEncryption { get; set; } = true;
+        public bool AutoDeleteTempFile { get; set; } = true;
     }
 
     public sealed class ConnectionInfo
     {
         internal IContextChannel Channel { get; }
         internal IClientMethods Callback { get; }
+
+        public string SessionId { get; }
+        public string IdentityName { get; }
+        public string IpAddress { get; }
+        public int? Port { get; }
+        public DateTime ConnectedAt { get; }
+
+        public object SendLock { get; } = new object();
+
+        private string machineName;
+        public string MachineName
+        {
+            get => machineName ?? IpAddress;
+            private set => machineName = value;
+        }
 
         public ConnectionInfo(string sessionId, IContextChannel channel, IClientMethods callback, string identityName, string address, int? port)
         {
@@ -35,82 +52,87 @@ namespace NetTcpHub.Server
             Callback = callback;
             IdentityName = identityName;
             IpAddress = address;
-            MachineName = GetClientMachineName(address);
             Port = port;
             ConnectedAt = DateTime.UtcNow;
+
+            // Resolve machine name asynchronously in background to avoid blocking the handshake
+            if (!string.IsNullOrWhiteSpace(address))
+            {
+                Task.Run(() => ResolveMachineNameAsync(address));
+            }
         }
 
-        public string SessionId { get; }
-        public string IdentityName { get; }
-        public string IpAddress { get; }
-        public string MachineName { get; }
-        public int? Port { get; }
-        public DateTime ConnectedAt { get; }
-
-        public static string GetClientMachineName(string ipAddress)
+        private async Task ResolveMachineNameAsync(string ipAddress)
         {
             try
             {
-                System.Net.IPHostEntry hostEntry = System.Net.Dns.GetHostEntry(ipAddress);//Resolves IP to FQDN
-                return hostEntry.HostName;
+                var hostEntry = await Dns.GetHostEntryAsync(ipAddress);
+                if (!string.IsNullOrWhiteSpace(hostEntry?.HostName))
+                {
+                    MachineName = hostEntry.HostName;
+                }
             }
             catch
             {
-                return ipAddress; // Fallback if reverse DNS (PTR record) is not configured
+                // Fallback to IP address if PTR resolution fails
+                MachineName = ipAddress;
             }
         }
-
-        // Protects concurrent writes to this specific client's callback channel
-        //public object SendLock { get; } = new object();
-
-        // Optional per-session metadata storage
-        //public ConcurrentDictionary<string, object> Metadata { get; } = new ConcurrentDictionary<string, object>();
     }
-
 
     public class TcpHubServer : IDisposable
     {
-        //private string GetAuthenticatedUser()
-        //{
-        //    var identity = ServiceSecurityContext.Current?.WindowsIdentity;
-
-        //    if (identity is null || !identity.IsAuthenticated) throw new FaultException("Windows authentication required.");
-
-        //    return identity.Name;
-        //}
-
         [ServiceBehavior(InstanceContextMode = InstanceContextMode.PerSession, ConcurrencyMode = ConcurrencyMode.Multiple)]
         internal class TcpHubServerMethods : IServerMethods
         {
             private readonly TcpHubServer server;
             private readonly ConnectionInfo connectionInfo;
+
             public TcpHubServerMethods(TcpHubServer server, InstanceContext instanceContext)
             {
                 this.server = server;
 
                 var context = OperationContext.Current;
-                if (context is not null)
+                if (context != null)
                 {
                     var endpoint = (RemoteEndpointMessageProperty)context.IncomingMessageProperties[RemoteEndpointMessageProperty.Name];
                     this.connectionInfo = new ConnectionInfo(
-                        context.SessionId, context.Channel, context.GetCallbackChannel<IClientMethods>(),
-                        context.ServiceSecurityContext?.PrimaryIdentity?.Name, endpoint?.Address, endpoint?.Port);
+                        context.SessionId,
+                        context.Channel,
+                        context.GetCallbackChannel<IClientMethods>(),
+                        context.ServiceSecurityContext?.PrimaryIdentity?.Name,
+                        endpoint?.Address,
+                        endpoint?.Port);
                     SubscribeEvents();
                 }
-                server.OnClientConnectionChanged(connectionInfo.SessionId, ConnectionStatus.Connected);
+
+                if (connectionInfo != null)
+                {
+                    server.OnClientConnectionChanged(connectionInfo.SessionId, ConnectionStatus.Connected);
+                }
             }
 
-            public void Send(HubMessage message) => server.ReceivedMessage(OperationContext.Current.SessionId, message);
-            public void Upload(Stream stream) => server.ReceivedStream(OperationContext.Current.SessionId, stream);
+            public void Send(HubMessage message) =>
+                server.ReceivedMessage(OperationContext.Current?.SessionId, message);
 
-            private void Channel_Opening(object sender, EventArgs e) => server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Connecting);
-            private void Channel_Opened(object sender, EventArgs e) => server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Connected);
+            public void Upload(Stream stream) =>
+                server.ReceivedStream(OperationContext.Current?.SessionId, stream);
+
+            private void Channel_Opening(object sender, EventArgs e) =>
+                server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Connecting);
+
+            private void Channel_Opened(object sender, EventArgs e) =>
+                server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Connected);
+
             private void Channel_Faulted(object sender, EventArgs e)
             {
                 UnsubscribeEvents();
                 server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Faulted);
             }
-            private void Channel_Closing(object sender, EventArgs e) => server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Disconnecting);
+
+            private void Channel_Closing(object sender, EventArgs e) =>
+                server.OnClientConnectionChanged(connectionInfo?.SessionId, ConnectionStatus.Disconnecting);
+
             private void Channel_Closed(object sender, EventArgs e)
             {
                 UnsubscribeEvents();
@@ -119,16 +141,20 @@ namespace NetTcpHub.Server
 
             private void SubscribeEvents()
             {
-                connectionInfo.Channel.Opening += Channel_Opening;
-                connectionInfo.Channel.Opened += Channel_Opened;
-                connectionInfo.Channel.Faulted += Channel_Faulted;
-                connectionInfo.Channel.Closing += Channel_Closing;
-                connectionInfo.Channel.Closed += Channel_Closed;
-                server.RegisterClient(connectionInfo.SessionId, connectionInfo);
+                if (connectionInfo?.Channel != null)
+                {
+                    connectionInfo.Channel.Opening += Channel_Opening;
+                    connectionInfo.Channel.Opened += Channel_Opened;
+                    connectionInfo.Channel.Faulted += Channel_Faulted;
+                    connectionInfo.Channel.Closing += Channel_Closing;
+                    connectionInfo.Channel.Closed += Channel_Closed;
+                    server.RegisterClient(connectionInfo.SessionId, connectionInfo);
+                }
             }
+
             private void UnsubscribeEvents()
             {
-                if (connectionInfo.Channel is not null)
+                if (connectionInfo?.Channel != null)
                 {
                     connectionInfo.Channel.Opening -= Channel_Opening;
                     connectionInfo.Channel.Opened -= Channel_Opened;
@@ -140,33 +166,37 @@ namespace NetTcpHub.Server
             }
         }
 
-        private readonly ConcurrentDictionary<string, ConnectionInfo> connections = new ConcurrentDictionary<string, ConnectionInfo>();
-
-
-        public bool IsRunning => host != null && host.State == CommunicationState.Opened;
+        private readonly ConcurrentDictionary<string, ConnectionInfo> connections =
+            new ConcurrentDictionary<string, ConnectionInfo>();
 
         private readonly CustomBinding customBinding;
         private readonly Uri address;
         private readonly string servicePath;
+        private readonly bool autoDeleteTempFile;
+        private ServiceHost host;
+        private bool disposed;
+
+        public bool IsRunning => host != null && host.State == CommunicationState.Opened;
+
         public TcpHubServer(TcpHubServerOptions options)
         {
-            if (options is null) throw new ArgumentNullException(nameof(options));
+            if (options == null) throw new ArgumentNullException(nameof(options));
             if (string.IsNullOrWhiteSpace(options.ServicePath)) throw new ArgumentException("ServicePath is required.");
 
+            autoDeleteTempFile = options.AutoDeleteTempFile;
+
             var binding = new NetTcpBinding(SecurityMode.Transport);
+            binding.Security.Transport.ClientCredentialType = TcpClientCredentialType.Windows;
+            binding.Security.Transport.ProtectionLevel = options.EnableEncryption
+                ? ProtectionLevel.EncryptAndSign
+                : ProtectionLevel.Sign;
+            binding.MaxReceivedMessageSize = options.MaxReceivedMessageSize;
+            binding.MaxConnections = options.MaxConnections;
 
             customBinding = new CustomBinding(binding);
             var interceptElement = new ConnectionInterceptBindingElement();
             interceptElement.ClientConnected += InterceptElement_ClientConnected;
-            //interceptElement.ClientDisconnected += InterceptElement_ClientDisconnected;
             customBinding.Elements.Insert(customBinding.Elements.Count - 1, interceptElement);
-
-            binding.Security.Transport.ClientCredentialType = TcpClientCredentialType.Windows;
-            binding.Security.Transport.ProtectionLevel = options.EnableEncryption ? System.Net.Security.ProtectionLevel.EncryptAndSign : System.Net.Security.ProtectionLevel.Sign;
-            binding.MaxReceivedMessageSize = options.MaxReceivedMessageSize;
-            binding.MaxConnections = options.MaxConnections;
-            //binding.ReliableSession.Enabled = true;
-            //binding.ReliableSession.InactivityTimeout = TimeSpan.FromMinutes(5);
 
             address = new Uri($"net.tcp://0.0.0.0:{options.Port}/");
             servicePath = options.ServicePath;
@@ -174,14 +204,12 @@ namespace NetTcpHub.Server
 
         private void InterceptElement_ClientConnected(IChannel channel)
         {
-            if (channel is IDuplexSessionChannel sessionChannel) OnClientConnectionChanged(sessionChannel.Session?.Id, ConnectionStatus.Connecting);
+            if (channel is IDuplexSessionChannel sessionChannel)
+            {
+                OnClientConnectionChanged(sessionChannel.Session?.Id, ConnectionStatus.Connecting);
+            }
         }
-        //private void InterceptElement_ClientDisconnected(IChannel channel)
-        //{
-        //    if (channel is IDuplexSessionChannel sessionChannel) OnClientConnectionChanged(sessionChannel.Session?.Id, ConnectionStatus.Disconnecting);
-        //}
 
-        private ServiceHost host;
         public void Start()
         {
             if (IsRunning) return;
@@ -195,7 +223,6 @@ namespace NetTcpHub.Server
             host.Faulted += Host_Faulted;
             host.Closing += Host_Closing;
             host.Closed += Host_Closed;
-
 
             host.Open();
         }
@@ -211,107 +238,141 @@ namespace NetTcpHub.Server
         public event EventHandlerExt<TcpHubServer, ConnectionChangedEventArgs> ConnectionChanged;
         public event EventHandlerExt<TcpHubServer, ConnectionChangedEventArgs> ClientConnectionChanged;
 
-
         public void SendMessage(string sessionId, HubMessage message)
         {
-            if (connections.TryGetValue(sessionId, out var clientMethods))
+            if (string.IsNullOrWhiteSpace(sessionId)) return;
+            ValidateMessage(message);
+
+            if (connections.TryGetValue(sessionId, out var connectionInfo))
             {
-                clientMethods.Callback.Send(message);
+                lock (connectionInfo.SendLock)
+                {
+                    connectionInfo.Callback.Send(message);
+                }
             }
         }
+
         public void SendFile(string sessionId, string filePath)
         {
-            if (connections.TryGetValue(sessionId, out var clientMethods))
+            if (string.IsNullOrWhiteSpace(sessionId)) return;
+            if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentNullException(nameof(filePath));
+            if (!File.Exists(filePath)) throw new FileNotFoundException("File not found.", filePath);
+
+            if (connections.TryGetValue(sessionId, out var connectionInfo))
             {
-                using (FileStream fs = File.OpenRead(filePath))
+                lock (connectionInfo.SendLock)
                 {
-                    clientMethods.Callback.Upload(fs);
+                    using (FileStream fs = File.OpenRead(filePath))
+                    {
+                        connectionInfo.Callback.Upload(fs);
+                    }
+                }
+            }
+        }
+
+        public void Broadcast(HubMessage message)
+        {
+            ValidateMessage(message);
+
+            foreach (var kvp in connections)
+            {
+                try
+                {
+                    lock (kvp.Value.SendLock)
+                    {
+                        kvp.Value.Callback.Send(message);
+                    }
+                }
+                catch
+                {
+                    UnregisterClient(kvp.Key);
                 }
             }
         }
 
         private void ReceivedMessage(string sessionId, HubMessage message)
         {
-            if (connections.TryGetValue(sessionId, out var connectionInfo))
+            try
+            {
+                ValidateMessage(message);
+            }
+            catch
+            {
+                return;
+            }
+
+            if (sessionId != null && connections.TryGetValue(sessionId, out var connectionInfo))
             {
                 OnMessageReceived(sessionId, connectionInfo.IdentityName, message);
             }
             else
             {
                 OnMessageReceived(sessionId, null, message);
-
             }
         }
+
         private void ReceivedStream(string sessionId, Stream stream)
         {
             string tempFile = Path.GetTempFileName();
-            using (var fileStream = new FileStream(tempFile, FileMode.Open, FileAccess.ReadWrite))
+            try
             {
-                stream.CopyTo(fileStream);
+                using (var fileStream = new FileStream(tempFile, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                {
+                    stream.CopyTo(fileStream);
+                }
+
+                OnFileReceived(sessionId, tempFile);
             }
-
-            OnFileReceived(sessionId, tempFile);
+            finally
+            {
+                if (autoDeleteTempFile && File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
         }
-
 
         internal void RegisterClient(string sessionId, ConnectionInfo callback)
         {
-            connections.TryAdd(sessionId, callback);
+            if (!string.IsNullOrWhiteSpace(sessionId))
+            {
+                connections.TryAdd(sessionId, callback);
+            }
         }
-        //internal void UpdateHeartbeat(Guid connectionId)
-        //{
-        //    var connection = registry.Get(connectionId);
-        //    if (connection != null) connection.LastSeenUtc = DateTime.UtcNow;
-        //}
+
         internal void UnregisterClient(string sessionId)
         {
-            connections.TryRemove(sessionId, out _);
+            if (!string.IsNullOrWhiteSpace(sessionId))
+            {
+                connections.TryRemove(sessionId, out _);
+            }
         }
 
         private static void ValidateMessage(HubMessage message)
         {
-            if (message == null) throw new FaultException("Message cannot be null.");
-
-            if (string.IsNullOrWhiteSpace(message.Data)) throw new FaultException("Data cannot be empty.");
-            if (message.Data.Length > 100000) throw new FaultException("Data exceeds maximum length.");
-
-            if (string.IsNullOrWhiteSpace(message.DataType)) throw new FaultException("DataType required.");
-
-            if (message.MessageId == Guid.Empty) throw new FaultException("MessageId cannot be empty.");
-            if (message.CreatedUtc == default) throw new FaultException("CreatedUtc cannot be empty.");
-
-            //string authenticatedUser = GetAuthenticatedUser();
-
-            //if (!string.Equals(authenticatedUser, username, StringComparison.OrdinalIgnoreCase)) throw new FaultException("Identity mismatch.");
+            if (message == null) throw new ArgumentNullException(nameof(message), "Message cannot be null.");
+            if (string.IsNullOrWhiteSpace(message.Data)) throw new ArgumentException("Data cannot be empty.");
+            if (message.Data.Length > 100000) throw new ArgumentException("Data exceeds maximum length.");
+            if (string.IsNullOrWhiteSpace(message.DataType)) throw new ArgumentException("DataType required.");
+            if (message.MessageId == Guid.Empty) message.MessageId = Guid.NewGuid();
+            if (message.CreatedUtc == default) message.CreatedUtc = DateTime.UtcNow;
         }
 
+        private void OnMessageReceived(string sessionId, string userName, HubMessage message) =>
+            MessageReceived?.Invoke(this, new MessageReceivedEventArgs { SessionId = sessionId, UserName = userName, Message = message });
 
-        private void OnMessageReceived(string sessionId, string userName, HubMessage message) => MessageReceived?.Invoke(this, new MessageReceivedEventArgs { SessionId = sessionId, UserName = userName, Message = message });
-        private void OnConnectionChanged(ConnectionStatus connectionStatus) => ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connectionStatus));
-        private void OnClientConnectionChanged(string sessionId, ConnectionStatus connectionStatus) => ClientConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connectionStatus) { SessionId = sessionId });
-        private void OnFileReceived(string sessionId, string filePath) => FileReceived?.Invoke(this, new FileReceivedEventArgs { SessionId = sessionId, FilePath = filePath });
+        private void OnConnectionChanged(ConnectionStatus connectionStatus) =>
+            ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connectionStatus));
 
-        //public void SendToUser(string username, HubMessage message)
-        //{
-        //    foreach (var connection in registry.GetUserConnections(username))
-        //    {
-        //        try { connection.Callback.Send(message); }
-        //        catch { UnregisterClient(connection.ConnectionId, "Callback failed."); }
-        //    }
-        //}
+        private void OnClientConnectionChanged(string sessionId, ConnectionStatus connectionStatus) =>
+            ClientConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connectionStatus) { SessionId = sessionId });
 
-        public void Broadcast(HubMessage message)
-        {
-            foreach (var connection in connections)
-            {
-                try { connection.Value.Callback.Send(message); }
-                catch { UnregisterClient(connection.Key); }
-            }
-        }
+        private void OnFileReceived(string sessionId, string filePath) =>
+            FileReceived?.Invoke(this, new FileReceivedEventArgs { SessionId = sessionId, FilePath = filePath });
 
         public void Stop()
         {
-            if (host is null) return;
+            if (host == null) return;
             try
             {
                 if (host.State == CommunicationState.Faulted) host.Abort();
@@ -321,13 +382,13 @@ namespace NetTcpHub.Server
             finally { host = null; }
         }
 
-        private bool disposed;
         protected virtual void Dispose(bool disposing)
         {
             if (disposed) return;
             if (disposing) Stop();
             disposed = true;
         }
+
         public void Dispose()
         {
             Dispose(true);
@@ -346,7 +407,10 @@ namespace NetTcpHub.Server
         }
 
         public object GetInstance(InstanceContext instanceContext, Message message) => GetInstance(instanceContext);
-        public void ReleaseInstance(InstanceContext instanceContext, object instance) { if (instance is IDisposable disposable) disposable.Dispose(); }
+        public void ReleaseInstance(InstanceContext instanceContext, object instance)
+        {
+            if (instance is IDisposable disposable) disposable.Dispose();
+        }
     }
 
     internal sealed class TcpHubServiceBehavior : IServiceBehavior
@@ -371,20 +435,24 @@ namespace NetTcpHub.Server
         public void Validate(ServiceDescription serviceDescription, ServiceHostBase serviceHostBase) { }
     }
 
-
-    // 1. Custom BindingElement that wraps the underlying TCP ChannelListener
     internal sealed class ConnectionInterceptBindingElement : BindingElement
     {
         public event Action<IChannel> ClientConnected;
         public event Action<IChannel> ClientDisconnected;
 
-        public override IChannelListener<TChannel> BuildChannelListener<TChannel>(BindingContext context) => new InterceptingChannelListener<TChannel>(context.BuildInnerChannelListener<TChannel>(), ClientConnected, ClientDisconnected);
-        public override bool CanBuildChannelListener<TChannel>(BindingContext context) => context.CanBuildInnerChannelListener<TChannel>();
-        public override BindingElement Clone() => new ConnectionInterceptBindingElement { ClientConnected = this.ClientConnected, ClientDisconnected = this.ClientDisconnected };
-        public override T GetProperty<T>(BindingContext context) => context.GetInnerProperty<T>();
+        public override IChannelListener<TChannel> BuildChannelListener<TChannel>(BindingContext context) =>
+            new InterceptingChannelListener<TChannel>(context.BuildInnerChannelListener<TChannel>(), ClientConnected, ClientDisconnected);
+
+        public override bool CanBuildChannelListener<TChannel>(BindingContext context) =>
+            context.CanBuildInnerChannelListener<TChannel>();
+
+        public override BindingElement Clone() =>
+            new ConnectionInterceptBindingElement { ClientConnected = this.ClientConnected, ClientDisconnected = this.ClientDisconnected };
+
+        public override T GetProperty<T>(BindingContext context) =>
+            context.GetInnerProperty<T>();
     }
 
-    // 2. Wrapper around IChannelListener that intercepts AcceptChannel
     internal sealed class InterceptingChannelListener<TChannel> : ChannelListenerBase<TChannel> where TChannel : class, IChannel
     {
         private readonly IChannelListener<TChannel> innerListener;
@@ -404,7 +472,6 @@ namespace NetTcpHub.Server
         {
             if (channel != null)
             {
-                // Fires IMMEDIATELY when client finishes channel.Open()!
                 onClientAccepted?.Invoke(channel);
 
                 channel.Closed += Channel_Closed;
@@ -427,7 +494,6 @@ namespace NetTcpHub.Server
             }
         }
 
-
         protected override TChannel OnAcceptChannel(TimeSpan timeout) => WrapAcceptedChannel(innerListener.AcceptChannel(timeout));
         protected override IAsyncResult OnBeginAcceptChannel(TimeSpan timeout, AsyncCallback callback, object state) => innerListener.BeginAcceptChannel(timeout, callback, state);
         protected override TChannel OnEndAcceptChannel(IAsyncResult result) => WrapAcceptedChannel(innerListener.EndAcceptChannel(result));
@@ -443,6 +509,4 @@ namespace NetTcpHub.Server
         protected override void OnAbort() => innerListener.Abort();
         public override T GetProperty<T>() => innerListener.GetProperty<T>();
     }
-
-
 }
