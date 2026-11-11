@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net472</TargetFramework>
+		<OutputType>Library</OutputType>
+		<Platforms>x64</Platforms>
+		<Configurations>Debug;Release;</Configurations>
+	</PropertyGroup>
+
+
+	<PropertyGroup Condition="'$(Configuration)'=='Debug'">
+		<DefineConstants>DEBUG;TRACE;</DefineConstants>
+		<DebugSymbols>true</DebugSymbols>
+		<Optimize>false</Optimize>
+		<SignAssembly>false</SignAssembly>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)'=='Release'">
+		<DefineConstants>Release;</DefineConstants>
+		<DebugSymbols>false</DebugSymbols>
+		<Optimize>true</Optimize>
+		<SignAssembly>true</SignAssembly>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Reference Include="System" />
+		<Reference Include="System.Core" />
+	  <Reference Include="System.DirectoryServices.AccountManagement" />
+		<Reference Include="System.Runtime.Serialization" />
+		<Reference Include="System.ServiceModel" />
+	</ItemGroup>
+
+</Project>
