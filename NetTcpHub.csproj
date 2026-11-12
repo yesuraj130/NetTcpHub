@@ -5,6 +5,7 @@
 		<OutputType>Library</OutputType>
 		<Platforms>x64</Platforms>
 		<Configurations>Debug;Release;</Configurations>
+		<LangVersion>preview</LangVersion>
 	</PropertyGroup>
 
 	<PropertyGroup Condition="'$(Configuration)'=='Debug'">
