@@ -1,16 +1,13 @@
 using System;
 using System.IO;
 using System.Net.Security;
-using System.Security.Authentication;
 using System.Security.Principal;
 using System.ServiceModel;
-using System.ServiceModel.Security;
-using System.Threading;
 using System.Threading.Tasks;
-using NetTcpHub.Contracts;
 
-namespace NetTcpHub.Client
+namespace NetTcpHub
 {
+
     public class TcpHubClientOptions
     {
         public string ServerName { get; set; }
@@ -24,21 +21,36 @@ namespace NetTcpHub.Client
         public int SendTimeoutSeconds { get; set; } = 60;
         public int ReceiveTimeoutMinutes { get; set; } = 10;
         public int CloseTimeoutSeconds { get; set; } = 30;
+
         public bool AutoReconnect { get; set; } = true;
-        public bool AutoDeleteTempFile { get; set; } = true;
     }
 
     public class MessageReceivedEventArgs : EventArgs
     {
-        public string UserName { get; set; }
-        public string SessionId { get; set; }
-        public HubMessage Message { get; set; }
+        public MessageReceivedEventArgs(string userName, string sessionId, HubMessage message)
+        {
+            UserName = userName;
+            SessionId = sessionId;
+            Message = message;
+        }
+
+        public string UserName { get; }
+        public string SessionId { get; }
+        public HubMessage Message { get; }
     }
 
     public class FileReceivedEventArgs : EventArgs
     {
-        public string SessionId { get; set; }
-        public string FilePath { get; set; }
+        public FileReceivedEventArgs(string sessionId, string filePath, bool autoDelete)
+        {
+            SessionId = sessionId;
+            FilePath = filePath;
+            AutoDelete = autoDelete;
+        }
+
+        public string SessionId { get; }
+        public string FilePath { get; }
+        public bool AutoDelete { get; set; }
     }
 
     public class ConnectionChangedEventArgs : EventArgs
@@ -49,7 +61,6 @@ namespace NetTcpHub.Client
     }
 
     public delegate void EventHandlerExt<TSender, TEventArgs>(TSender sender, TEventArgs e);
-
     public class TcpHubClient : IDisposable
     {
         private class TcpHubClientMethods : IClientMethods
@@ -60,62 +71,51 @@ namespace NetTcpHub.Client
             public void Upload(Stream stream) => tcpHubClient.ReceivedStream(stream);
         }
 
+#pragma warning disable CA2213 // Disposable fields should be disposed
         private DuplexChannelFactory<IServerMethods> channelFactory;
+#pragma warning restore CA2213 // Disposable fields should be disposed
         private IServerMethods proxy;
         private IClientChannel clientChannel;
+
         private readonly bool reconnectEnabled;
-        private readonly bool autoDeleteTempFile;
         private readonly NetTcpBinding binding;
-        private readonly EndpointAddress address;
-        private readonly bool allowNtlm;
         private readonly string serverName;
+        private readonly bool allowNtlm;
+        private readonly EndpointAddress address;
 
         private readonly object sync = new object();
-        private volatile bool isUserDisconnecting;
-        private volatile bool reconnecting;
-        private int reconnectAttempts;
-        private CancellationTokenSource reconnectCts = new CancellationTokenSource();
-        private bool disposed;
 
         public bool IsConnected => Status == ConnectionStatus.Connected;
-        public ConnectionStatus Status => clientChannel == null
-            ? ConnectionStatus.NotConnected
-            : ToConnectionStatus(clientChannel.State);
+        public ConnectionStatus Status => clientChannel is null ? ConnectionStatus.NotConnected : clientChannel.State.ToConnectionStatus();
+        //public string Username => ConnectionInfo?.UserIdentity;
 
         public TcpHubClient(TcpHubClientOptions options)
         {
-            if (options == null) throw new ArgumentNullException(nameof(options));
+            if (options is null) throw new ArgumentNullException(nameof(options));
             if (string.IsNullOrWhiteSpace(options.ServerName)) throw new ArgumentException("Server name is required.");
-
-            serverName = options.ServerName;
-            reconnectEnabled = options.AutoReconnect;
-            autoDeleteTempFile = options.AutoDeleteTempFile;
 
             binding = new NetTcpBinding(SecurityMode.Transport);
             binding.Security.Transport.ClientCredentialType = TcpClientCredentialType.Windows;
-            binding.Security.Transport.ProtectionLevel = options.EnableEncryption
-                ? ProtectionLevel.EncryptAndSign
-                : ProtectionLevel.Sign;
+            binding.Security.Transport.ProtectionLevel = options.EnableEncryption ? ProtectionLevel.EncryptAndSign : ProtectionLevel.Sign; ;
             binding.MaxReceivedMessageSize = options.MaxReceivedMessageSize;
             binding.OpenTimeout = TimeSpan.FromSeconds(options.OpenTimeoutSeconds);
             binding.SendTimeout = TimeSpan.FromSeconds(options.SendTimeoutSeconds);
             binding.ReceiveTimeout = TimeSpan.FromMinutes(options.ReceiveTimeoutMinutes);
             binding.CloseTimeout = TimeSpan.FromSeconds(options.CloseTimeoutSeconds);
 
-            EndpointIdentity identity;
-            if (!string.IsNullOrWhiteSpace(options.ServerIdentity))
-            {
-                identity = EndpointIdentity.CreateUpnIdentity(options.ServerIdentity);
-            }
-            else
-            {
-                identity = EndpointIdentity.CreateDnsIdentity(options.ServerName);
-            }
+            reconnectEnabled = options.AutoReconnect;
+            allowNtlm = options.AllowNtlm;
+            serverName = options.ServerName;
 
+            //binding.ReliableSession.Enabled = true;
+            //binding.ReliableSession.InactivityTimeout = TimeSpan.FromMinutes(5);
+
+            EndpointIdentity identity = !string.IsNullOrWhiteSpace(options.ServerIdentity) ? EndpointIdentity.CreateUpnIdentity(options.ServerIdentity) : EndpointIdentity.CreateDnsIdentity(options.ServerName);
+            //EndpointIdentity identity = EndpointIdentity.CreateUpnIdentity(UserPrincipal.Current.UserPrincipalName);
             var serviceUri = new Uri($"net.tcp://{options.ServerName}:{options.Port}/{options.ServicePath.Trim('/')}");
             address = new EndpointAddress(serviceUri, identity);
-            allowNtlm = options.AllowNtlm;
         }
+
 
         public void Connect()
         {
@@ -128,7 +128,9 @@ namespace NetTcpHub.Client
 
                 var context = new InstanceContext(new TcpHubClientMethods(this));
                 channelFactory = new DuplexChannelFactory<IServerMethods>(context, binding, address);
+#pragma warning disable CS0618 // Type or member is obsolete
                 if (!allowNtlm) channelFactory.Credentials.Windows.AllowNtlm = false;
+#pragma warning restore CS0618 // Type or member is obsolete
                 channelFactory.Credentials.Windows.AllowedImpersonationLevel = TokenImpersonationLevel.Identification;
 
                 try
@@ -144,17 +146,15 @@ namespace NetTcpHub.Client
 
                     clientChannel.Open();
                 }
-                catch (SecurityNegotiationException ex)
+                catch (System.ServiceModel.Security.SecurityNegotiationException ex)
                 {
                     Cleanup();
-                    throw new InvalidOperationException(
-                        $"Security negotiation failed with server '{serverName}'. Ensure Windows credentials, NTLM permissions, and encryption/protection levels match the server configuration.", ex);
+                    throw new InvalidOperationException($"Security negotiation failed with server '{serverName}'. Ensure Windows credentials, NTLM permissions, and encryption/protection levels match the server configuration.", ex);
                 }
-                catch (AuthenticationException ex)
+                catch (System.Security.Authentication.AuthenticationException ex)
                 {
                     Cleanup();
-                    throw new InvalidOperationException(
-                        $"Authentication failed with server '{serverName}'. Ensure Windows identity has access.", ex);
+                    throw new InvalidOperationException($"Authentication failed with server '{serverName}'. Ensure Windows identity has access.", ex);
                 }
                 catch
                 {
@@ -163,11 +163,9 @@ namespace NetTcpHub.Client
                 }
             }
         }
-
         public void Disconnect()
         {
             isUserDisconnecting = true;
-            CancelReconnect();
             Cleanup();
             OnConnectionChanged(ConnectionStatus.Disconnected);
         }
@@ -178,102 +176,79 @@ namespace NetTcpHub.Client
             reconnectAttempts = 0;
             OnConnectionChanged(ConnectionStatus.Connected);
         }
-
         private void Channel_Faulted(object sender, EventArgs e)
         {
             OnConnectionChanged(ConnectionStatus.Faulted);
-            if (!isUserDisconnecting && reconnectEnabled)
-            {
-                _ = AttemptReconnect();
-            }
+            if (!isUserDisconnecting && reconnectEnabled) _ = AttemptReconnect();
         }
-
         private void Channel_Closing(object sender, EventArgs e) => OnConnectionChanged(ConnectionStatus.Disconnecting);
-
         private void Channel_Closed(object sender, EventArgs e)
         {
             OnConnectionChanged(ConnectionStatus.Disconnected);
-            if (!isUserDisconnecting && reconnectEnabled)
-            {
-                _ = AttemptReconnect();
-            }
+            if (!isUserDisconnecting && reconnectEnabled) _ = AttemptReconnect();
         }
 
+#pragma warning disable CA1003 // Use generic event handler instances
         public event EventHandlerExt<TcpHubClient, MessageReceivedEventArgs> MessageReceived;
         public event EventHandlerExt<TcpHubClient, FileReceivedEventArgs> FileReceived;
         public event EventHandlerExt<TcpHubClient, ConnectionChangedEventArgs> ConnectionChanged;
+#pragma warning restore CA1003 // Use generic event handler instances
 
-        public void SendMessage(HubMessage message)
+        private void OnMessageReceived(HubMessage message) => MessageReceived?.Invoke(this, new MessageReceivedEventArgs(null, null, message));
+        private void OnFileReceived(FileReceivedEventArgs eventArgs) => FileReceived?.Invoke(this, eventArgs);
+        private void OnConnectionChanged(ConnectionStatus connectionStatus) => ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connectionStatus));
+        
+        public bool SendMessage(HubMessage message)
         {
-            EnsureConnected();
-            ValidateMessage(message);
+            if (!IsConnected) return false;
             proxy.Send(message);
+            return true;
         }
-
-        public void SendFile(string filePath)
+        public bool SendFile(string filePath)
         {
-            EnsureConnected();
             if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentNullException(nameof(filePath));
             if (!File.Exists(filePath)) throw new FileNotFoundException("File not found.", filePath);
 
-            using (FileStream fs = File.OpenRead(filePath))
+            if (!IsConnected) return false;
+            using (var fileStream = File.OpenRead(filePath))
             {
-                proxy.Upload(fs);
+                proxy.Upload(fileStream);
             }
+            return true;
         }
 
         private void ReceivedMessage(HubMessage message)
         {
-            try
-            {
-                ValidateMessage(message);
-            }
-            catch
-            {
-                return;
-            }
-
+            message.ValidateMessage();
             OnMessageReceived(message);
         }
-
         private void ReceivedStream(Stream stream)
         {
             string tempFile = Path.GetTempFileName();
+            var eventArgs = new FileReceivedEventArgs(null, tempFile, true);
             try
             {
-                using (var fileStream = new FileStream(tempFile, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                using (var fileStream = new FileStream(tempFile, FileMode.Open, FileAccess.ReadWrite))
                 {
                     stream.CopyTo(fileStream);
                 }
 
-                OnFileReceived(tempFile);
+                OnFileReceived(eventArgs);
             }
             finally
             {
-                if (autoDeleteTempFile && File.Exists(tempFile))
-                {
-                    try { File.Delete(tempFile); } catch { }
-                }
+                if (eventArgs.AutoDelete && File.Exists(tempFile)) File.Delete(tempFile);
             }
         }
 
-        private void EnsureConnected()
-        {
-            if (!IsConnected) throw new InvalidOperationException("Client is not connected.");
-        }
-
-        private void OnMessageReceived(HubMessage message) =>
-            MessageReceived?.Invoke(this, new MessageReceivedEventArgs { Message = message });
-
-        private void OnFileReceived(string filePath) =>
-            FileReceived?.Invoke(this, new FileReceivedEventArgs { FilePath = filePath });
-
-        private void OnConnectionChanged(ConnectionStatus connectionStatus) =>
-            ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connectionStatus));
-
+        private int reconnectAttempts;
+        private volatile bool reconnecting;
+        private volatile bool isUserDisconnecting;
         private async Task AttemptReconnect()
         {
+            //if (!reconnectEnabled) return;
             if (reconnecting || isUserDisconnecting || disposed) return;
+
 
             lock (sync)
             {
@@ -283,30 +258,25 @@ namespace NetTcpHub.Client
 
             try
             {
-                var token = reconnectCts.Token;
-                while (!disposed && !isUserDisconnecting && !IsConnected && !token.IsCancellationRequested)
+                //status = ConnectionStatus.Reconnecting;
+
+                while (!disposed && !isUserDisconnecting && !IsConnected)
                 {
                     try
                     {
                         reconnectAttempts++;
-                        var delaySeconds = Math.Min((int)Math.Pow(2, Math.Min(reconnectAttempts, 6)), 60);
-                        await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+                        var delaySeconds = Math.Min((int)Math.Pow(2, reconnectAttempts), 60);
+                        await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
 
-                        if (isUserDisconnecting || disposed) break;
+                        if (isUserDisconnecting || disposed || IsConnected) break;
 
                         Cleanup();
                         Connect();
+
                         reconnectAttempts = 0;
                         return;
                     }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch
-                    {
-                        // Will retry on next loop
-                    }
+                    catch { } // Will retry on next loop
                 }
             }
             finally
@@ -314,54 +284,11 @@ namespace NetTcpHub.Client
                 reconnecting = false;
             }
         }
-
-        private void CancelReconnect()
-        {
-            try
-            {
-                reconnectCts.Cancel();
-                reconnectCts.Dispose();
-                reconnectCts = new CancellationTokenSource();
-            }
-            catch { }
-        }
-
-        private static ConnectionStatus ToConnectionStatus(CommunicationState state)
-        {
-            switch (state)
-            {
-                case CommunicationState.Created:
-                    return ConnectionStatus.NotConnected;
-                case CommunicationState.Opening:
-                    return ConnectionStatus.Connecting;
-                case CommunicationState.Opened:
-                    return ConnectionStatus.Connected;
-                case CommunicationState.Closing:
-                    return ConnectionStatus.Disconnecting;
-                case CommunicationState.Closed:
-                    return ConnectionStatus.Disconnected;
-                case CommunicationState.Faulted:
-                    return ConnectionStatus.Faulted;
-                default:
-                    return ConnectionStatus.NotConnected;
-            }
-        }
-
-        private static void ValidateMessage(HubMessage message)
-        {
-            if (message == null) throw new ArgumentNullException(nameof(message), "Message cannot be null.");
-            if (string.IsNullOrWhiteSpace(message.Data)) throw new ArgumentException("Data cannot be empty.");
-            if (message.Data.Length > 100000) throw new ArgumentException("Data exceeds maximum length.");
-            if (string.IsNullOrWhiteSpace(message.DataType)) throw new ArgumentException("DataType required.");
-            if (message.MessageId == Guid.Empty) message.MessageId = Guid.NewGuid();
-            if (message.CreatedUtc == default) message.CreatedUtc = DateTime.UtcNow;
-        }
-
         private void Cleanup()
         {
             try
             {
-                if (clientChannel != null)
+                if (clientChannel is not null)
                 {
                     clientChannel.Opening -= Channel_Opening;
                     clientChannel.Opened -= Channel_Opened;
@@ -374,34 +301,32 @@ namespace NetTcpHub.Client
                 }
             }
             catch { clientChannel?.Abort(); }
+            clientChannel = null;
+            proxy = null;
 
             try
             {
-                if (channelFactory != null)
+                if (channelFactory is not null)
                 {
                     if (channelFactory.State == CommunicationState.Faulted) channelFactory.Abort();
                     else channelFactory.Close();
                 }
             }
             catch { channelFactory?.Abort(); }
-
-            clientChannel = null;
-            proxy = null;
             channelFactory = null;
         }
 
+        private bool disposed;
         protected virtual void Dispose(bool disposing)
         {
             if (disposed) return;
             if (disposing)
             {
+                disposed = true;
                 isUserDisconnecting = true;
-                CancelReconnect();
                 Cleanup();
             }
-            disposed = true;
         }
-
         public void Dispose()
         {
             Dispose(true);
