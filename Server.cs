@@ -11,6 +11,8 @@ using System.Reflection;
 using System.ServiceModel.Security;
 using System.Security.Principal;
 using System.Collections.Generic;
+using System.Text;
+using System.Threading.Tasks;
 
 namespace NetTcpHub
 {
@@ -82,7 +84,7 @@ namespace NetTcpHub
     {
         #region Private Classes
         [ServiceBehavior(InstanceContextMode = InstanceContextMode.PerSession, ConcurrencyMode = ConcurrencyMode.Multiple)]
-        internal sealed class TcpHubServerMethods : IServerMethods
+        internal sealed class TcpHubServerMethods : IServerMethods, IDisposable
         {
             private readonly TcpHubServer server;
             private readonly ConnectionInfo connectionInfo;
@@ -154,6 +156,7 @@ namespace NetTcpHub
                 }
                 if (connectionInfo is not null) server.UnregisterClient(connectionInfo.SessionId);
             }
+            public void Dispose() => UnsubscribeEvents();
         }
         #endregion
 
@@ -161,7 +164,9 @@ namespace NetTcpHub
         #region Fields
         private readonly ConcurrentDictionary<string, ConnectionInfo> connections = new ConcurrentDictionary<string, ConnectionInfo>();
         private readonly CustomBinding customBinding;
+        private readonly InterceptingBindingElement interceptElement;
         private readonly TcpHubServerOptions options;
+        private readonly object hostLock = new object();
 #pragma warning disable CA2213 // Disposable fields should be disposed
         private ServiceHost host;
 #pragma warning restore CA2213 // Disposable fields should be disposed
@@ -179,26 +184,29 @@ namespace NetTcpHub
             binding.Security.Transport.ProtectionLevel = serverOptions.EnableEncryption ? System.Net.Security.ProtectionLevel.EncryptAndSign : System.Net.Security.ProtectionLevel.Sign;
             binding.MaxReceivedMessageSize = serverOptions.MaxReceivedMessageSize;
             binding.MaxConnections = serverOptions.MaxConnections;
+            binding.OpenTimeout = TimeSpan.FromSeconds(serverOptions.OpenTimeoutSeconds);
+            binding.SendTimeout = TimeSpan.FromSeconds(serverOptions.SendTimeoutSeconds);
+            binding.ReceiveTimeout = TimeSpan.FromMinutes(serverOptions.ReceiveTimeoutMinutes);
+            binding.CloseTimeout = TimeSpan.FromSeconds(serverOptions.CloseTimeoutSeconds);
             //binding.ReliableSession.Enabled = true;
             //binding.ReliableSession.InactivityTimeout = TimeSpan.FromMinutes(5);
 
             customBinding = new CustomBinding(binding);
-            var interceptElement = new InterceptingBindingElement();
+            interceptElement = new InterceptingBindingElement();
             interceptElement.ConnectionChanged += InterceptElement_ConnectionChanged;
             var securityIndex = customBinding.Elements.IndexOf(customBinding.Elements.Find<WindowsStreamSecurityBindingElement>());
             if (securityIndex >= 0) customBinding.Elements.Insert(securityIndex, interceptElement);
             else customBinding.Elements.Insert(customBinding.Elements.Count - 1, interceptElement);
         }
-        public static TcpHubServer Create(TcpHubServerOptions clientOptions, out string error)
+        public static TcpHubServer Create(TcpHubServerOptions serverOptions, out string error)
         {
-            if (!ValidateServerOptions(clientOptions, out error)) return null;
-            return new TcpHubServer(clientOptions);
+            if (!ValidateServerOptions(serverOptions, out error)) return null;
+            return new TcpHubServer(serverOptions);
         }
         private static bool ValidateServerOptions(TcpHubServerOptions serverOptions, out string error)
         {
             if (serverOptions is null) { error = $"{nameof(serverOptions)} cannot be null"; return false; }
-            if (serverOptions.Port < 1) { error = $"{nameof(serverOptions.Port)} must be a positive integer"; return false; }
-            if (serverOptions.Port < 1000) { error = $"{nameof(serverOptions.Port)} must be at least 4 digits"; return false; }
+            if (serverOptions.Port < 1000 || serverOptions.Port > 65535) { error = $"{nameof(serverOptions.Port)} must be between 1000 and 65535"; return false; }
             if (string.IsNullOrWhiteSpace(serverOptions.ServicePath)) { error = $"{nameof(serverOptions.ServicePath)} cannot be empty"; return false; }
             error = null; return true;
         }
@@ -211,35 +219,39 @@ namespace NetTcpHub
 
         public bool Start(out string error)
         {
-            if (IsRunning) { error = $"already running"; return false; }
-
-            try
+            lock (hostLock)
             {
-                host = new ServiceHost(typeof(TcpHubServerMethods), new Uri($"net.tcp://0.0.0.0:{options.Port}/"));
-                host.Description.Behaviors.Add(new TcpHubServiceBehavior(this));
-                host.AddServiceEndpoint(typeof(IServerMethods), customBinding, options.ServicePath);
+                if (disposed) { error = "already disposed"; return false; }
+                if (IsRunning) { error = $"already running"; return false; }
 
-                host.Opening += Host_Opening;
-                host.Opened += Host_Opened;
-                host.Faulted += Host_Faulted;
-                host.Closing += Host_Closing;
-                host.Closed += Host_Closed;
+                try
+                {
+                    host = new ServiceHost(typeof(TcpHubServerMethods), new Uri($"net.tcp://0.0.0.0:{options.Port}/"));
+                    host.Description.Behaviors.Add(new TcpHubServiceBehavior(this));
+                    host.AddServiceEndpoint(typeof(IServerMethods), customBinding, options.ServicePath);
 
-                host.Open();
-                error = null; return true;
-            }
-            catch (Exception ex)
-            {
-                CleanUp();
-                error = $"{ex.Message}.\n\n{ex}";
-                return false;
+                    host.Opening += Host_Opening;
+                    host.Opened += Host_Opened;
+                    host.Faulted += Host_Faulted;
+                    host.Closing += Host_Closing;
+                    host.Closed += Host_Closed;
+
+                    host.Open();
+                    error = null; return true;
+                }
+                catch (Exception ex)
+                {
+                    CleanUp();
+                    error = $"{ex.Message}.\n\n{ex}";
+                    return false;
+                }
             }
         }
         //private bool isUserDisconnecting;
         public void Stop()
         {
             //isUserDisconnecting = true;
-            CleanUp();
+            lock (hostLock) { CleanUp(); }
         }
         #endregion
 
@@ -292,7 +304,7 @@ namespace NetTcpHub
         private bool ValidateMessage(HubMessage message, out string error)
         {
             if (!message.ValidateMessage(out error)) return false;
-            if (message.Data.Length > options.MaxReceivedMessageSize) { error = $"{nameof(message.Data)} cannot be more than {options.MaxReceivedMessageSize}"; return false; }
+            if (Encoding.UTF8.GetByteCount(message.Data) > options.MaxReceivedMessageSize) { error = $"{nameof(message.Data)} cannot be more than {options.MaxReceivedMessageSize}"; return false; }
             return true;
         }
         public bool SendMessage(string sessionId, HubMessage message, out string error)
@@ -308,7 +320,9 @@ namespace NetTcpHub
                 {
                     lock (connectionInfo.SendLock)
                     {
-                        connectionInfo.Callback.Send(message);
+                        var callback = connectionInfo.Callback;
+                        if (callback is null) { error = $"callback not initialized for {sessionId}"; return false; }
+                        callback.Send(message);
                     }
                     return true;
                 }
@@ -325,17 +339,18 @@ namespace NetTcpHub
             if (!IsRunning) { error = "server not running"; return false; }
             if (!ValidateMessage(message, out error)) return false;
 
-            var errorMessage = new List<string>();
-            foreach (var kvPair in connections)
+            var errorMessage = new ConcurrentBag<string>();
+            Parallel.ForEach(connections.Values, connectionInfo =>
             {
-                var connectionInfo = kvPair.Value;
                 if (connectionInfo is not null)
                 {
                     try
                     {
                         lock (connectionInfo.SendLock)
                         {
-                            connectionInfo.Callback.Send(message);
+                            var callback = connectionInfo.Callback;
+                            if (callback is null) { errorMessage.Add($"{connectionInfo.SessionId}: callback not initialized"); return; }
+                            callback.Send(message);
                         }
                     }
                     catch (Exception ex)
@@ -343,15 +358,15 @@ namespace NetTcpHub
                         errorMessage.Add($"{connectionInfo.SessionId}: {ex.Message}");
                     }
                 }
-            }
+            });
 
-            if (errorMessage.Count > 1)
+            if (errorMessage.Count > 0)
             {
                 error = string.Join("\n", errorMessage); return false;
             }
             else
             {
-                return true;
+                error = null; return true;
             }
         }
         public bool SendFile(string sessionId, string filePath, HubMessage message, out string error)
@@ -366,11 +381,15 @@ namespace NetTcpHub
             {
                 try
                 {
-                    lock (connectionInfo.SendLock)
+                    using (var fileStream = File.OpenRead(filePath))
                     {
-                        using (var fileStream = File.OpenRead(filePath))
+                        if (fileStream.Length + Encoding.UTF8.GetByteCount(message.Data) > options.MaxReceivedMessageSize) { error = $"File and message size cannot be more than {options.MaxReceivedMessageSize}"; return false; }
+                        var request = new FileUploadRequest(message, Path.GetFileName(filePath), fileStream.Length, fileStream);
+                        lock (connectionInfo.SendLock)
                         {
-                            connectionInfo.Callback.Upload(new FileUploadRequest(message, filePath, fileStream.Length, fileStream));
+                            var callback = connectionInfo.Callback;
+                            if (callback is null) { error = $"callback not initialized for {sessionId}"; return false; }
+                            callback.Upload(request);
                         }
                     }
                     return true;
@@ -386,7 +405,7 @@ namespace NetTcpHub
 
         private bool ReceivedMessage(string sessionId, HubMessage message)
         {
-            if (!message.ValidateMessage(out var error)) { OnMessageReceived(sessionId, "", new HubMessage(message.MessageId, "Error", error)); return false; }
+            if (!message.ValidateMessage(out var error)) { OnMessageReceived(sessionId, "", new HubMessage(message?.MessageId ?? Guid.NewGuid(), "Error", error)); return false; }
 
             var connectionInfo = GetConnectionInfo(sessionId);
             if (connectionInfo is not null) { OnMessageReceived(sessionId, connectionInfo.IdentityName, message); return true; }
@@ -396,17 +415,23 @@ namespace NetTcpHub
         }
         private bool ReceivedStream(string sessionId, FileUploadRequest stream)
         {
-            if (!stream.HubMessage.ValidateMessage(out var error)) { OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream.HubMessage.MessageId, "Error", error), true)); return false; }
+            if (stream is null || !stream.HubMessage.ValidateMessage(out var error))
+            {
+                stream?.FileStream?.Dispose();
+                OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream?.HubMessage?.MessageId ?? Guid.NewGuid(), "Error", stream is null ? $"{nameof(stream)} is null" : error), true));
+                return false;
+            }
             if (stream.FileStream is null) { OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"{nameof(stream.FileStream)} is null"), true)); return false; }
 
             var connectionInfo = GetConnectionInfo(sessionId);
             if (connectionInfo is not null)
             {
-                string tempFile = Path.GetTempFileName();
-                var eventArgs = new FileReceivedEventArgs(sessionId, stream.FileName, stream.HubMessage, true);
+                string tempFile = Path.Combine(Path.GetTempPath(), $"NetTcpHub_{Guid.NewGuid():N}.tmp");
+                var eventArgs = new FileReceivedEventArgs(sessionId, tempFile, stream.HubMessage, true, Path.GetFileName(stream.FileName));
                 try
                 {
-                    using (var fileStream = new FileStream(tempFile, FileMode.Open, FileAccess.ReadWrite))
+                    using (stream.FileStream)
+                    using (var fileStream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.SequentialScan))
                     {
                         stream.FileStream.CopyTo(fileStream);
                     }
@@ -421,7 +446,12 @@ namespace NetTcpHub
                     if (eventArgs.AutoDelete && File.Exists(tempFile)) File.Delete(tempFile);
                 }
             }
-            else { OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"Unknown message received from {sessionId}"), true)); return false; }
+            else
+            {
+                stream.FileStream.Dispose();
+                OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"Unknown message received from {sessionId}"), true));
+                return false;
+            }
 
         }
         #endregion
@@ -445,9 +475,9 @@ namespace NetTcpHub
         #region CleanUp and Dispose
         private void DisconnectAllClients()
         {
-            foreach (var kvPair in connections)
+            Parallel.ForEach(connections.Values, connectionInfo =>
             {
-                var clientChannel = kvPair.Value?.Channel;
+                var clientChannel = connectionInfo?.Channel;
                 if (clientChannel is not null)
                 {
                     try
@@ -457,7 +487,7 @@ namespace NetTcpHub
                     }
                     catch { clientChannel.Abort(); }
                 }
-            }
+            });
             connections.Clear();
         }
         private void CleanUp()
@@ -474,14 +504,19 @@ namespace NetTcpHub
                 finally { host = null; }
             }
         }
-        private bool disposed;
+        private volatile bool disposed;
         protected virtual void Dispose(bool disposing)
         {
             if (disposed) return;
             if (disposing)
             {
-                disposed = true;
-                CleanUp();
+                lock (hostLock)
+                {
+                    if (disposed) return;
+                    disposed = true;
+                    if (interceptElement is not null) interceptElement.ConnectionChanged -= InterceptElement_ConnectionChanged;
+                    CleanUp();
+                }
             }
         }
         public void Dispose()
@@ -593,9 +628,9 @@ namespace NetTcpHub
                 connectionChanged?.Invoke(channel, ConnectionStatus.Disconnected);
             }
 
-            void Channel_Opening(object sender, EventArgs e) => connectionChanged(channel, ConnectionStatus.Connecting);
-            void Channel_Opened(object sender, EventArgs e) => connectionChanged(channel, ConnectionStatus.Connected);
-            void Channel_Closing(object sender, EventArgs e) => connectionChanged(channel, ConnectionStatus.Disconnecting);
+            void Channel_Opening(object sender, EventArgs e) => connectionChanged?.Invoke(channel, ConnectionStatus.Connecting);
+            void Channel_Opened(object sender, EventArgs e) => connectionChanged?.Invoke(channel, ConnectionStatus.Connected);
+            void Channel_Closing(object sender, EventArgs e) => connectionChanged?.Invoke(channel, ConnectionStatus.Disconnecting);
 
         }
 

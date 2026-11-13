@@ -4,6 +4,7 @@ using System.Net.Security;
 using System.Security.Principal;
 using System.ServiceModel;
 using System.ServiceModel.Dispatcher;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace NetTcpHub
@@ -58,7 +59,7 @@ namespace NetTcpHub
 
             binding = new NetTcpBinding(SecurityMode.Transport);
             binding.Security.Transport.ClientCredentialType = TcpClientCredentialType.Windows;
-            binding.Security.Transport.ProtectionLevel = clientOptions.EnableEncryption ? ProtectionLevel.EncryptAndSign : ProtectionLevel.Sign; ;
+            binding.Security.Transport.ProtectionLevel = clientOptions.EnableEncryption ? ProtectionLevel.EncryptAndSign : ProtectionLevel.Sign;
             binding.MaxReceivedMessageSize = clientOptions.MaxReceivedMessageSize;
             binding.OpenTimeout = TimeSpan.FromSeconds(clientOptions.OpenTimeoutSeconds);
             binding.SendTimeout = TimeSpan.FromSeconds(clientOptions.SendTimeoutSeconds);
@@ -80,8 +81,7 @@ namespace NetTcpHub
         {
             if (clientOptions is null) { error = $"{nameof(clientOptions)} cannot be null"; return false; }
             if (string.IsNullOrWhiteSpace(clientOptions.ServerName)) { error = $"{nameof(clientOptions.ServerName)} cannot be empty"; return false; }
-            if (clientOptions.Port < 1) { error = $"{nameof(clientOptions.Port)} must be a positive integer"; return false; }
-            if (clientOptions.Port < 1000) { error = $"{nameof(clientOptions.Port)} must be at least 4 digits"; return false; }
+            if (clientOptions.Port < 1000 || clientOptions.Port > 65535) { error = $"{nameof(clientOptions.Port)} must be between 1000 and 65535"; return false; }
             if (string.IsNullOrWhiteSpace(clientOptions.ServicePath)) { error = $"{nameof(clientOptions.ServicePath)} cannot be empty"; return false; }
             error = null; return true;
         }
@@ -92,14 +92,17 @@ namespace NetTcpHub
         public bool IsConnected => Status == ConnectionStatus.Connected;
         public ConnectionStatus Status => clientChannel is null ? ConnectionStatus.NotConnected : clientChannel.State.ToConnectionStatus();
 
-        public bool Connect(out string error)
+        public bool Connect(out string error) => ConnectInternal(false, out error);
+        private bool ConnectInternal(bool isReconnect, out string error)
         {
             if (disposed) { error = $"already disposed"; return false; }
 
             lock (sync)
             {
+                if (disposed) { error = $"already disposed"; return false; }
+                if (isReconnect && isUserDisconnecting) { error = "disconnected by user"; return false; }
                 if (IsConnected) { error = $"already connected"; return false; }
-                isUserDisconnecting = false;
+                if (!isReconnect) isUserDisconnecting = false;
 
                 try
                 {
@@ -154,7 +157,7 @@ namespace NetTcpHub
         public void Disconnect()
         {
             isUserDisconnecting = true;
-            CleanUp();
+            lock (sync) { CleanUp(); }
         }
         #endregion
 
@@ -188,6 +191,7 @@ namespace NetTcpHub
                 clientChannel.Closed -= Channel_Closed;
             }
 
+            lock (sync) { CleanUp(); }
             OnConnectionChanged(((IContextChannel)sender)?.SessionId, ConnectionStatus.Faulted);
             if (!isUserDisconnecting && options.AutoReconnect) _ = AttemptReconnect();
         }
@@ -198,6 +202,7 @@ namespace NetTcpHub
         public event EventHandlerExt<TcpHubClient, ConnectionChangedEventArgs> ConnectionChanged;
 #pragma warning restore CA1003 // Use generic event handler instances
 
+        // Note: Event handlers execute synchronously on WCF threads; subscribers should avoid blocking or throwing unhandled exceptions.
         private void OnMessageReceived(HubMessage message) => MessageReceived?.Invoke(this, new MessageReceivedEventArgs(null, null, message));
         private void OnFileReceived(FileReceivedEventArgs eventArgs) => FileReceived?.Invoke(this, eventArgs);
         private void OnConnectionChanged(string sessionId, ConnectionStatus connectionStatus) => ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(sessionId, connectionStatus));
@@ -208,17 +213,18 @@ namespace NetTcpHub
         private bool ValidateMessage(HubMessage message, out string error)
         {
             if (!message.ValidateMessage(out error)) return false;
-            if (message.Data.Length > options.MaxReceivedMessageSize) { error = $"{nameof(message.Data)} cannot be more than {options.MaxReceivedMessageSize}"; return false; }
+            if (Encoding.UTF8.GetByteCount(message.Data) > options.MaxReceivedMessageSize) { error = $"{nameof(message.Data)} cannot be more than {options.MaxReceivedMessageSize}"; return false; }
             return true;
         }
         public bool SendMessage(HubMessage message, out string error)
         {
-            if (!IsConnected) { error = "Not connected"; return false; }
+            var currentProxy = proxy;
+            if (!IsConnected || currentProxy is null) { error = "Not connected"; return false; }
             if (!ValidateMessage(message, out error)) return false;
 
             try
             {
-                proxy.Send(message);
+                currentProxy.Send(message);
                 return true;
             }
             catch (Exception ex)
@@ -229,7 +235,8 @@ namespace NetTcpHub
         }
         public bool SendFile(string filePath, HubMessage message, out string error)
         {
-            if (!IsConnected) { error = "Not connected"; return false; }
+            var currentProxy = proxy;
+            if (!IsConnected || currentProxy is null) { error = "Not connected"; return false; }
             if (!ValidateMessage(message, out error)) return false;
             if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) { error = "File not exists"; return false; }
 
@@ -237,7 +244,8 @@ namespace NetTcpHub
             {
                 using (var fileStream = File.OpenRead(filePath))
                 {
-                    proxy.Upload(new FileUploadRequest(message, filePath, fileStream.Length, fileStream));
+                    if (fileStream.Length + Encoding.UTF8.GetByteCount(message.Data) > options.MaxReceivedMessageSize) { error = $"File and message size cannot be more than {options.MaxReceivedMessageSize}"; return false; }
+                    currentProxy.Upload(new FileUploadRequest(message, Path.GetFileName(filePath), fileStream.Length, fileStream));
                 }
                 return true;
             }
@@ -250,29 +258,37 @@ namespace NetTcpHub
 
         private bool ReceivedMessage(HubMessage message)
         {
-            if (!message.ValidateMessage(out var error)) { OnMessageReceived(new HubMessage(message.MessageId, "Error", error)); return false; }
+            if (!message.ValidateMessage(out var error)) { OnMessageReceived(new HubMessage(message?.MessageId ?? Guid.NewGuid(), "Error", error)); return false; }
             else { OnMessageReceived(message); return true; }
         }
         private bool ReceivedStream(FileUploadRequest stream)
         {
-            if (!stream.HubMessage.ValidateMessage(out var error)) { OnFileReceived(new FileReceivedEventArgs(null, null, new HubMessage(stream.HubMessage.MessageId, "Error", error), true)); return false; }
+            if (stream is null || !stream.HubMessage.ValidateMessage(out var error))
+            {
+                stream?.FileStream?.Dispose();
+                OnFileReceived(new FileReceivedEventArgs(null, null, new HubMessage(stream?.HubMessage?.MessageId ?? Guid.NewGuid(), "Error", stream is null ? $"{nameof(stream)} is null" : error), true));
+                return false;
+            }
             if (stream.FileStream is null) { OnFileReceived(new FileReceivedEventArgs(null, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"{nameof(stream.FileStream)} is null"), true)); return false; }
 
-            var tempFile = Path.GetTempFileName();
-            var eventArgs = new FileReceivedEventArgs(null, stream.FileName, stream.HubMessage, true);
+            var tempFile = Path.Combine(Path.GetTempPath(), $"NetTcpHub_{Guid.NewGuid():N}.tmp");
+            var eventArgs = new FileReceivedEventArgs(null, tempFile, stream.HubMessage, true, Path.GetFileName(stream.FileName));
             try
             {
-                try
+                using (stream.FileStream)
                 {
-                    using (var fileStream = new FileStream(tempFile, FileMode.Open, FileAccess.ReadWrite))
+                    try
                     {
-                        stream.FileStream.CopyTo(fileStream);
+                        using (var fileStream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.SequentialScan))
+                        {
+                            stream.FileStream.CopyTo(fileStream);
+                        }
+                        OnFileReceived(eventArgs); return true;
                     }
-                    OnFileReceived(eventArgs); return true;
-                }
-                catch (Exception ex)
-                {
-                    OnFileReceived(new FileReceivedEventArgs(null, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"{ex.Message}.\n\n{ex}"), true)); return false;
+                    catch (Exception ex)
+                    {
+                        OnFileReceived(new FileReceivedEventArgs(null, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"{ex.Message}.\n\n{ex}"), true)); return false;
+                    }
                 }
             }
             finally
@@ -304,13 +320,13 @@ namespace NetTcpHub
                 while (!disposed && !isUserDisconnecting && !IsConnected)
                 {
                     reconnectAttempts++;
-                    var delaySeconds = Math.Min((int)Math.Pow(2, reconnectAttempts), 60);
+                    var delaySeconds = Math.Min(1 << Math.Min(reconnectAttempts, 6), 60);
                     await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
 
                     if (isUserDisconnecting || disposed || IsConnected) break;
 
-                    CleanUp();
-                    if (Connect(out var _))
+                    lock (sync) { CleanUp(); }
+                    if (ConnectInternal(true, out var _))
                     {
                         reconnectAttempts = 0;
                         return;
@@ -349,15 +365,19 @@ namespace NetTcpHub
             }
         }
 
-        private bool disposed;
+        private volatile bool disposed;
         protected virtual void Dispose(bool disposing)
         {
             if (disposed) return;
             if (disposing)
             {
-                disposed = true;
                 isUserDisconnecting = true;
-                CleanUp();
+                lock (sync)
+                {
+                    if (disposed) return;
+                    disposed = true;
+                    CleanUp();
+                }
             }
         }
         public void Dispose()

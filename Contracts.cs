@@ -11,17 +11,20 @@ namespace NetTcpHub
         public int Port { get; init; }
         public string ServicePath { get; init; }
 
-        public bool AllowNtlm { get; init; } = false;
         public bool EnableEncryption { get; init; } = true;
 
         public long MaxReceivedMessageSize { get; init; } = 1024 * 1024;
         public int MaxConnections { get; init; } = 100;
+        public int OpenTimeoutSeconds { get; init; } = 30;
+        public int SendTimeoutSeconds { get; init; } = 60;
+        public int ReceiveTimeoutMinutes { get; init; } = 10;
+        public int CloseTimeoutSeconds { get; init; } = 30;
     }
 
     public record TcpHubClientOptions
     {
         public string ServerName { get; init; }
-        public int Port { get; set; }
+        public int Port { get; init; }
         public string ServicePath { get; init; }
         public string UserIdentity { get; init; }
 
@@ -58,15 +61,17 @@ namespace NetTcpHub
 
     public class FileReceivedEventArgs : EventArgs
     {
-        public FileReceivedEventArgs(string sessionId, string filePath, HubMessage message, bool autoDelete)
+        public FileReceivedEventArgs(string sessionId, string filePath, HubMessage message, bool autoDelete, string fileName = null)
         {
             SessionId = sessionId;
+            FileName = fileName;
             FilePath = filePath;
             AutoDelete = autoDelete;
             Message = message;
         }
 
         public string SessionId { get; }
+        public string FileName { get; }
         public string FilePath { get; }
         public bool AutoDelete { get; set; }
         public HubMessage Message { get; }
@@ -95,7 +100,7 @@ namespace NetTcpHub
             MessageId = messageId;
             DataType = dataType;
             Data = data;
-            CreatedTime = DateTime.Now;
+            CreatedTime = DateTime.UtcNow;
         }
 
         [DataMember] public Guid MessageId { get; }
