@@ -5,69 +5,126 @@ using System.ServiceModel;
 
 namespace NetTcpHub
 {
-    [ServiceContract(CallbackContract = typeof(IClientMethods), SessionMode = SessionMode.Required)]
-    internal interface IServerMethods
+    #region Options
+    public record TcpHubServerOptions
     {
-        [OperationContract(IsOneWay = true)] void Send(HubMessage message);
-        [OperationContract(IsOneWay = true)] void Upload(Stream stream);
+        public int Port { get; init; }
+        public string ServicePath { get; init; }
+
+        public bool AllowNtlm { get; init; } = false;
+        public bool EnableEncryption { get; init; } = true;
+
+        public long MaxReceivedMessageSize { get; init; } = 1024 * 1024;
+        public int MaxConnections { get; init; } = 100;
     }
 
-
-    internal interface IClientMethods
+    public record TcpHubClientOptions
     {
-        [OperationContract(IsOneWay = true)] void Send(HubMessage message);
-        [OperationContract(IsOneWay = true)] void Upload(Stream stream);
+        public string ServerName { get; init; }
+        public int Port { get; set; }
+        public string ServicePath { get; init; }
+        public string UserIdentity { get; init; }
+
+        public bool AllowNtlm { get; init; } = false;
+        public bool EnableEncryption { get; init; } = true;
+        public bool AutoReconnect { get; init; } = false;
+
+        public long MaxReceivedMessageSize { get; init; } = 1024 * 1024;
+        public int OpenTimeoutSeconds { get; init; } = 30;
+        public int SendTimeoutSeconds { get; init; } = 60;
+        public int ReceiveTimeoutMinutes { get; init; } = 10;
+        public int CloseTimeoutSeconds { get; init; } = 30;
+
+    }
+    #endregion
+
+
+    #region EventArgs
+    public delegate void EventHandlerExt<TSender, TEventArgs>(TSender sender, TEventArgs e);
+
+    public class MessageReceivedEventArgs : EventArgs
+    {
+        public MessageReceivedEventArgs(string userName, string sessionId, HubMessage message)
+        {
+            UserName = userName;
+            SessionId = sessionId;
+            Message = message;
+        }
+
+        public string UserName { get; }
+        public string SessionId { get; }
+        public HubMessage Message { get; }
     }
 
+    public class FileReceivedEventArgs : EventArgs
+    {
+        public FileReceivedEventArgs(string sessionId, string filePath, HubMessage message, bool autoDelete)
+        {
+            SessionId = sessionId;
+            FilePath = filePath;
+            AutoDelete = autoDelete;
+            Message = message;
+        }
+
+        public string SessionId { get; }
+        public string FilePath { get; }
+        public bool AutoDelete { get; set; }
+        public HubMessage Message { get; }
+    }
+
+    public class ConnectionChangedEventArgs : EventArgs
+    {
+        public string SessionId { get; }
+        public ConnectionStatus Status { get; }
+
+        public ConnectionChangedEventArgs(string sessionId, ConnectionStatus connectionStatus)
+        {
+            SessionId = sessionId;
+            Status = connectionStatus;
+        }
+    }
+    #endregion
+
+
+    #region DataStructure
     [DataContract]
     public class HubMessage
     {
-        [DataMember] public Guid MessageId { get; set; }
-        [DataMember] public string DataType { get; set; }
-        [DataMember] public string Data { get; set; }
-        [DataMember] public DateTime CreatedUtc { get; set; }
+        public HubMessage(Guid messageId, string dataType, string data)
+        {
+            MessageId = messageId;
+            DataType = dataType;
+            Data = data;
+            CreatedTime = DateTime.Now;
+        }
+
+        [DataMember] public Guid MessageId { get; }
+        [DataMember] public string DataType { get; }
+        [DataMember] public string Data { get; }
+        [DataMember] public DateTime CreatedTime { get; }
     }
 
-    //public enum MessageType
-    //{
-    //    Text = 0,
-    //    Notification = 1,
-    //    System = 2
-    //}
-
-    internal static class Helper
+    [MessageContract]
+    public class FileUploadRequest
     {
-        public static ConnectionStatus ToConnectionStatus(this CommunicationState state)
+        public FileUploadRequest() { }
+        public FileUploadRequest(HubMessage hubMessage, string fileName, long fileSize, Stream fileStream)
         {
-            switch (state)
-            {
-                case CommunicationState.Created: return ConnectionStatus.NotConnected;
-                case CommunicationState.Opening: return ConnectionStatus.Connecting;
-                case CommunicationState.Opened: return ConnectionStatus.Connected;
-                case CommunicationState.Closing: return ConnectionStatus.Disconnecting;
-                case CommunicationState.Closed: return ConnectionStatus.Disconnected;
-                case CommunicationState.Faulted: return ConnectionStatus.Faulted;
-                default: return ConnectionStatus.NotConnected;
-            }
+            HubMessage = hubMessage;
+            FileName = fileName;
+            FileSize = fileSize;
+            FileStream = fileStream;
         }
 
-        public static void ValidateMessage(this HubMessage message)
-        {
-            if (message is null) throw new ArgumentNullException(nameof(message), "Message cannot be null.");
-            if (string.IsNullOrWhiteSpace(message.Data)) throw new ArgumentException("Data cannot be empty.");
-            if (message.Data.Length > 100000) throw new ArgumentException("Data exceeds maximum length.");
-            if (string.IsNullOrWhiteSpace(message.DataType)) throw new ArgumentException("DataType required.");
-            if (message.MessageId == Guid.Empty) message.MessageId = Guid.NewGuid();
-            if (message.CreatedUtc == default) message.CreatedUtc = DateTime.UtcNow;
-
-
-            //string authenticatedUser = GetAuthenticatedUser();
-
-            //if (!string.Equals(authenticatedUser, username, StringComparison.OrdinalIgnoreCase)) throw new FaultException("Identity mismatch.");
-        }
+        [MessageHeader(MustUnderstand = true)] public HubMessage HubMessage { get; private set; }
+        [MessageHeader(MustUnderstand = true)] public string FileName { get; private set; }
+        [MessageHeader(MustUnderstand = true)] public long FileSize { get; private set; }
+        [MessageBodyMember(Order = 1)] public Stream FileStream { get; private set; }
     }
+    #endregion
 
 
+    #region Enums
     ///<summary>Represents the state of a connection.</summary>
     public enum ConnectionStatus
     {
@@ -89,6 +146,5 @@ namespace NetTcpHub
         ///<summary>The connection channel encountered an unrecoverable error and is no longer usable.</summary>
         Faulted,
     }
-
-
+    #endregion
 }
