@@ -1,0 +1,14 @@
+{
+  "name": "nettcp-hub",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "node -e \"require('http').createServer((_,res)=>res.end('NetTcpHub')).listen(3000,'0.0.0.0')\"",
+    "build": "echo \"No build step\"",
+    "lint": "echo \"No lint step\""
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

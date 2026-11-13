@@ -1,0 +1,6 @@
+{
+  "name": "NetTcpHub",
+  "description": "WCF NetTcp duplex messaging and file transfer hub library (.NET Framework 4.8).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
