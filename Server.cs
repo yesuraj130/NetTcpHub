@@ -415,10 +415,11 @@ namespace NetTcpHub
         }
         private bool ReceivedStream(string sessionId, FileUploadRequest stream)
         {
-            if (stream is null || !stream.HubMessage.ValidateMessage(out var error))
+            if (stream is null) { OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(Guid.NewGuid(), "Error", $"{nameof(stream)} is null"), true)); return false; }
+            if (!stream.HubMessage.ValidateMessage(out var error))
             {
-                stream?.FileStream?.Dispose();
-                OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream?.HubMessage?.MessageId ?? Guid.NewGuid(), "Error", stream is null ? $"{nameof(stream)} is null" : error), true));
+                stream.FileStream?.Dispose();
+                OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream.HubMessage?.MessageId ?? Guid.NewGuid(), "Error", error), true));
                 return false;
             }
             if (stream.FileStream is null) { OnFileReceived(new FileReceivedEventArgs(sessionId, null, new HubMessage(stream.HubMessage.MessageId, "Error", $"{nameof(stream.FileStream)} is null"), true)); return false; }
